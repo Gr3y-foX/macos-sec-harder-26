@@ -522,7 +522,7 @@ main() {
   done
 }
 
-# Если файл запущен напрямую (а не через source) — запускаем меню
+# If the file is run directly (rather than via `source`), open the menu
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   main
 fi

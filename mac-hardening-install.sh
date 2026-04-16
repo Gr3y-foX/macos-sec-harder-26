@@ -7,21 +7,21 @@
 #              IPv6 PF rules, Wazuh IDS, brew service fixes
 # ============================================================
 
-# Не запускать от root
+# Do not run as root
 if [[ "$EUID" -eq 0 ]]; then
     echo "Do not run as root. Homebrew will break."; exit 1
 fi
 
-# ── Строгий режим ──────────────────────────────────────────
-# set -u: ошибка при обращении к неопределённой переменной
-# set -o pipefail: ошибка если любая часть pipe падает
-# НЕ используем set -e глобально — вместо этого явно
-# проверяем критические команды через || { err "..."; exit 1; }
+# ── Strict mode ──────────────────────────────────────────
+# set -u: error when accessing an undefined variable
+# set -o pipefail: error if any part of the pipe fails
+# DO NOT use set -e globally — instead, explicitly
+# check critical commands using || { err "..."; exit 1; }
 set -uo pipefail
 
-# Глобальный trap только для непойманных сигналов — не для ERR
-# (убран оригинальный 'continue' trap, который скрывал ошибки)
-trap 'err "Прерван на строке $LINENO."; exit 1' INT TERM
+# Global trap only for uncaught signals — not for ERR
+# (the original 'continue' trap, which hid errors, has been removed)
+trap 'err "Interrupted at line $LINENO."; exit 1' INT TERM
 
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 RED='\033[0;31m';   CYAN='\033[0;36m'; NC='\033[0m'
@@ -30,7 +30,7 @@ warn() { echo -e "${YELLOW}[!]${NC} $1"; }
 err()  { echo -e "${RED}[✗]${NC} $1"; }
 info() { echo -e "${CYAN}[i]${NC} $1"; }
 
-# Завершить с сообщением об ошибке
+# Cancel with an error message
 die() { err "$1"; exit 1; }
 
 ask() {
@@ -43,18 +43,18 @@ ask() {
     fi
 }
 
-# ── Динамический префикс Homebrew (Intel vs Apple Silicon) ──
-# Определяется один раз после проверки наличия brew
+# ── Dynamic Homebrew prefix (Intel vs Apple Silicon) ──  
+# Determined once after checking for brew
 BREW_PREFIX=""
 
 resolve_brew_prefix() {
     BREW_PREFIX=$(brew --prefix 2>/dev/null) \
-        || die "brew --prefix failed. Homebrew не найден или сломан."
+        || die "brew --prefix failed. Homebrew not found or broken."
     log "Homebrew prefix: ${BREW_PREFIX}"
 }
 
 # ──────────────────────────────────────────
-# УСТАНОВКА FORMULA
+# INSTALL FORMULA
 # ──────────────────────────────────────────
 install_formula() {
     local pkg="$1"
@@ -71,7 +71,7 @@ install_formula() {
 }
 
 # ──────────────────────────────────────────
-# УСТАНОВКА CASK
+# INSTALL CASK
 # ──────────────────────────────────────────
 install_cask() {
     local pkg="$1"
@@ -115,7 +115,7 @@ install_cask() {
 }
 
 # ──────────────────────────────────────────
-# ЗАВИСИМОСТИ
+# DEPENDENCIES
 # ──────────────────────────────────────────
 check_requirements() {
     log "Checking requirements..."
@@ -124,7 +124,7 @@ check_requirements() {
         /bin/bash -c "$(curl -fsSL \
             https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" \
             || die "Homebrew install failed!"
-        # После установки на Apple Silicon shell нужно обновить PATH
+        # After installation on Apple Silicon, shell needs PATH update
         if [[ -f "/opt/homebrew/bin/brew" ]]; then
             eval "$(/opt/homebrew/bin/brew shellenv)"
         elif [[ -f "/usr/local/bin/brew" ]]; then
@@ -138,7 +138,7 @@ check_requirements() {
 }
 
 # ──────────────────────────────────────────
-# ИНТЕРНЕТ
+#  INTERNET
 # ──────────────────────────────────────────
 check_connectivity() {
     log "Checking connectivity..."
@@ -151,7 +151,7 @@ check_connectivity() {
 }
 
 # ──────────────────────────────────────────
-# FIREWALL
+#  FIREWALL
 # ──────────────────────────────────────────
 configure_firewall() {
     local FW="/usr/libexec/ApplicationFirewall/socketfilterfw"
@@ -269,8 +269,8 @@ harden_compilers() {
     for BIN in "${FOUND[@]}"; do info "  $(ls -la "$BIN")"; done
 
     echo ""
-    # [FIX v5] Опции переупорядочены: Lynis exception — рекомендуемый вариант
-    # для десктопа. chmod 750 помечен как advanced (серверы/лаборатории).
+    # [FIX v5] Options have been reordered: Lynis exception — recommended option
+    # for desktops. chmod 750 is marked as "advanced" (servers/labs).
     echo "  [1] Add Lynis exception (skip-test=HRDN-7222) — RECOMMENDED for desktops"
     echo "  [2] Restrict permissions (chmod 750, root only) — ADVANCED: hardened servers/labs only"
     echo "      WARNING: Может сломать Homebrew и Xcode build scripts!"
@@ -336,9 +336,9 @@ ask "Continue?" CONFIRM
 [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]] && { echo "Aborted."; exit 0; }
 echo ""
 
-check_requirements      # resolve_brew_prefix вызывается внутри
+check_requirements      # resolve_brew_prefix is called within
 check_connectivity
-configure_firewall   # Теперь с проверкой Quad9 profil перед применением
+configure_firewall   # Now, check the Quad9 profile before use
 install_security_tools
 harden_compilers
 apply_defaults
