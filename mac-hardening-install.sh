@@ -334,20 +334,100 @@ apply_defaults() {
     log "Defaults applied."
 }
 
+# ──────────────────────────────────────────
+# POWER MANAGEMENT (pmset)
+# ──────────────────────────────────────────
+harden_power_management() {
+  log "Checking power management (pmset)..."
+
+  # Show current values
+  info "Current pmset settings (subset for AC/Battery):"
+  pmset -g | sed 's/^/  /'
+
+  echo ""
+  echo "Recommended baseline (CIS-style):"
+  echo "  - System sleep:      15 minutes"
+  echo "  - Display sleep:     10 minutes"
+  echo "  - Wake for network:  disabled (womp 0)"
+  echo ""
+
+  ask "Apply these pmset settings?" CONFIRM_PM
+  if [[ "$CONFIRM_PM" != "y" && "$CONFIRM_PM" != "Y" ]]; then
+    log "Skipping pmset baseline."
+    return 0
+  fi
+
+  # Apply to all power sources (-a)
+  # sleep 15, displaysleep 10, womp 0
+  if sudo pmset -a sleep 15 displaysleep 10 womp 0; then
+    log "pmset baseline applied: sleep=15, displaysleep=10, womp=0"
+  else
+    err "pmset command failed. Check 'sudo pmset -g' manually."
+  fi
+}
+
+# ──────────────────────────────────────────
+# GATEKEEPER & FILEVAULT CHECKS
+# ──────────────────────────────────────────
+check_gatekeeper_filevault() {
+  echo ""
+  log "Checking Gatekeeper and FileVault status..."
+
+  # Gatekeeper
+  local GK_STATUS
+  if GK_STATUS=$(spctl --status 2>/dev/null); then
+    info "Gatekeeper: $GK_STATUS"
+    if echo "$GK_STATUS" | grep -qi "disabled"; then
+      warn "Gatekeeper is DISABLED."
+      ask "Enable Gatekeeper (spctl --master-enable)?" CONFIRM_GK
+      if [[ "$CONFIRM_GK" == "y" || "$CONFIRM_GK" == "Y" ]]; then
+        sudo spctl --master-enable && log "Gatekeeper enabled."
+      else
+        warn "Gatekeeper left disabled by user choice."
+      fi
+    fi
+  else
+    warn "Unable to determine Gatekeeper status."
+  fi
+
+  # FileVault
+  if command -v fdesetup &>/dev/null; then
+    local FV_STATUS
+    FV_STATUS=$(fdesetup status 2>/dev/null || true)
+    info "FileVault: $FV_STATUS"
+    if echo "$FV_STATUS" | grep -qi "FileVault is Off"; then
+      warn "FileVault is OFF."
+      info "Enable via: System Settings → Privacy & Security → FileVault."
+      # Here it's better not to enable FileVault automatically, only a recommendation.
+    fi
+  else
+    warn "fdesetup not found – cannot check FileVault."
+  fi
+}
+
 # ══════════════════════════════════════════
 # MAIN
 # ══════════════════════════════════════════
 clear
 echo ""
+echo "  ░██████████                      ░██                   ░██            "
+echo "  ░██                              ░██                   ░██            "
+echo "  ░██         ░███████  ░██    ░██ ░████████   ░███████  ░██  ░███████   "
+echo "  ░█████████ ░██    ░██  ░██  ░██  ░██    ░██ ░██    ░██ ░██ ░██    ░██  "
+echo "  ░██        ░██    ░██  ░██  ░██  ░██    ░██ ░██    ░██ ░██ ░██         "
+echo "  ░██         ░███████  ░██    ░██ ░██    ░██  ░███████  ░██  ░███████   "
+echo ""  
 echo "  ╔══════════════════════════════════════╗"
 echo "  ║   macOS Security Hardening Script    ║"
-echo "  ║           v5 · by Archont            ║"
+echo "  ║           v0.15 · by Archont         ║"
 echo "  ║     ARM/M-chip | strict mode         ║"
+echo "  ║       status        [ARMED]          ║"
 echo "  ╚══════════════════════════════════════╝"
-echo ""
+echo "  ║ [!] Unauthorized use is prohibited.  ║"
+echo "  ╚══════════════════════════════════════╝"
 warn "This script modifies system settings. Sudo required."
 ask "Continue?" CONFIRM
-[[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]] && { echo "Aborted."; exit 0; }
+[[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]] && { echo "Aborted by user."; exit 0; }
 echo ""
 
 check_requirements      # resolve_brew_prefix is called within
@@ -356,6 +436,8 @@ configure_firewall   # Now, check the Quad9 profile before use
 install_security_tools
 harden_compilers
 apply_defaults
+harden_power_management
+check_gatekeeper_filevault
 
 # Path to the scripts directory (to run related files)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -404,23 +486,45 @@ case "$NET_CHOICE" in
     ;;
 esac
 
-echo "  ╔══════════════════════════════════════╗"
-echo "  ║       Base hardening completed       ║"
-echo "  ╚══════════════════════════════════════╝"
-echo ""
 echo ""
 echo "  ╔══════════════════════════════════════╗"
-echo "  ║          MANUAL STEPS REMAIN         ║"
+echo "  ║        Base hardening complete       ║"
 echo "  ╚══════════════════════════════════════╝"
-info "1.  Quad9 DNS profile (если не установлен):"
-echo "      https://docs.quad9.net/assets/mobileconfig/Quad9_Secured_DNS_over_HTTPS_ECS_20260119.mobileconfig"
-info "2.  OpenVPN client:      https://openvpn.net/client/"
-info "3.  VPN check:      https://timbrica.com/en/vpn-checker"
-info "4.  DNS leak test:      https://www.dnsleaktest.com/results.html"
-info "5.  Pareto Security:     https://paretosecurity.com/apps"
-info "6.  Lynis audit:         sudo lynis audit system"
-info "7.  Package CVE scan:    brew vulns"
-info "8.  Python CVE scan:     pip-audit"
-info "9.  CIS Benchmark:       open /Applications/Mergen.app"
-info "10. Proxy toggle log:    tail -f /var/log/proxy-toggle.log"
+echo ""
+
+echo "  Additional manual steps (recommended):"
+echo ""
+
+# DNS & VPN
+info "DNS & VPN"
+echo "  1. Quad9 DNS profile (if not installed):"
+echo "       https://docs.quad9.net/assets/mobileconfig/Quad9_Secured_DNS_over_HTTPS_ECS_20260119.mobileconfig"
+info "  2. OpenVPN client:"
+echo "       https://openvpn.net/client/"
+info "  3. VPN check:"
+echo "       https://timbrica.com/en/vpn-checker"
+info "  4. DNS leak test:"
+echo "       https://www.dnsleaktest.com/results.html"
+echo ""
+
+# Audits & scanners
+info "Audits & scanners"
+info "  5. Pareto Security (GUI checks):"
+echo "       https://paretosecurity.com/apps"
+info "  6. Lynis system audit:"
+echo "       sudo lynis audit system"
+info "  7. Homebrew package CVE scan:"
+echo "       brew vulns"
+info "  8. Python dependency CVE scan:"
+echo "       pip-audit"
+echo ""
+
+# Tools & extras
+info "Tools & extras"
+info "  9. CIS benchmark assistant (Mergen):"
+echo "       open /Applications/Mergen.app"
+info " 10. Proxy toggle log (Privoxy/VPN autoswitch):"
+echo "       tail -f /var/log/proxy-toggle.log"
+echo ""
+
 info "Base hardening + selected network scenario completed. Stay paranoid. 🔒"
