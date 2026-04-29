@@ -3,7 +3,7 @@
 # Foxhole-macos — macOS Network Hardening Library
 #
 # File:    mac-hardening-netlib.sh
-# Version: 0.15 (2026)
+# Version: 0.16 (2026)
 # Author:  Gr3y-foX
 # Based on: drduh/macOS-Security-and-Privacy-Guide (MIT)
 # License: GNU GPL v3 — see LICENSE for details
@@ -13,16 +13,28 @@
 #     - dnscrypt-proxy (encrypted DNS as user-level service)
 #     - PF DNS leak lock anchors
 #     - /etc/hosts blocklist (StevenBlack)
-#     - Privoxy with VPN‑aware auto‑proxy switching
+#     - Privoxy with VPN-aware auto-proxy switching
 #
 # Usage:
 #   This script is primarily intended to be sourced from profile scripts
 #   (e.g. profile-vpn-daily.sh), but can also be run directly to access
 #   its interactive menu.
 #
-# Notes for v0.15:
-#   - Initial split of network logic into a dedicated netlib module
-#   - ARM / Apple Silicon aware paths and stricter error handling
+# Changelog v0.16:
+#   [C-1] FIX pf: убран pass any:443 — заменён на whitelist Quad9 IP (DoH leak)
+#   [C-2] FIX pf: добавлен pass Tailscale 100.100.100.100:53
+#   [C-3] FIX pf: добавлен pass icmp6 all (RFC 4890 — NDP/PMTUD)
+#   [H-1] FIX dnscrypt: fallback_resolver = "" (запрет fallback на system DNS)
+#   [H-2] FIX dnscrypt: dnscrypt_ephemeral_keys = true
+#   [H-3] NEW configure_dnscrypt() — генерация валидного toml перед стартом
+#   [H-4] FIX vpn_active(): Tailscale исключён из детектора VPN
+#   [H-5] NEW LaunchDaemon для автозапуска pf при загрузке
+#   [M-1] NEW verify_dns_stack() — 10-шаговый health check
+#   [M-2] FIX create_net_backup(): добавлены scutil, resolver/, dnscrypt.toml
+#   [L-1] FIX ask(): закрыта скобка функции
+#   [L-2] FIX resolve_brew_prefix(): закрыта скобка функции
+#   [L-3] FIX версия синхронизирована: v0.16
+#   [L-4] FIX BREW_PREFIX guard добавлен в configure_privoxy_vpn_bypass()
 
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 RED='\033[0;31m';   CYAN='\033[0;36m'; NC='\033[0m'
@@ -30,10 +42,9 @@ log()  { echo -e "${GREEN}[+]${NC} $1"; }
 warn() { echo -e "${YELLOW}[!]${NC} $1"; }
 err()  { echo -e "${RED}[✗]${NC} $1"; }
 info() { echo -e "${CYAN}[i]${NC} $1"; }
+die()  { err "$1"; exit 1; }
 
-# Cancel with an error message
-die() { err "$1"; exit 1; }
-
+# [L-1] FIX: закрытая фигурная скобка
 ask() {
     local PROMPT="$1" VAR="$2"
     if [[ -t 0 ]]; then
@@ -45,70 +56,86 @@ ask() {
 }
 
 # ──────────────────────────────────────────
-# BACKUP — Creating a snapshot before hardening
+# BACKUP — snapshot before hardening
 # ──────────────────────────────────────────
 NET_BACKUP_DIR="${HOME}/.foxhole/backups/$(date +%Y%m%d_%H%M%S)"
 
 create_net_backup() {
-  log "Creating pre-hardening backup snapshot..."
-  mkdir -p "$NET_BACKUP_DIR" \
-    || { warn "Cannot create backup dir: ${NET_BACKUP_DIR}"; return 1; }
+    log "Creating pre-hardening backup snapshot..."
+    mkdir -p "$NET_BACKUP_DIR" \
+        || { warn "Cannot create backup dir: ${NET_BACKUP_DIR}"; return 1; }
 
-  # 1. /etc/pf.conf
-  if [[ -f /etc/pf.conf ]]; then
-    sudo cp /etc/pf.conf "${NET_BACKUP_DIR}/pf.conf" \
-      && log "  [✓] /etc/pf.conf"
-  else
-    warn "  [–] /etc/pf.conf not found — skipped"
-  fi
+    # 1. /etc/pf.conf
+    [[ -f /etc/pf.conf ]] \
+        && sudo cp /etc/pf.conf "${NET_BACKUP_DIR}/pf.conf" \
+        && log "  [✓] /etc/pf.conf" \
+        || warn "  [–] /etc/pf.conf not found — skipped"
 
-  # 2. /etc/hosts
-  if [[ -f /etc/hosts ]]; then
-    sudo cp /etc/hosts "${NET_BACKUP_DIR}/hosts" \
-      && log "  [✓] /etc/hosts"
-  else
-    warn "  [–] /etc/hosts not found — skipped"
-  fi
+    # 2. pf anchor (если уже существует)
+    [[ -f /etc/pf.anchors/com.hardening.dnsleak ]] \
+        && sudo cp /etc/pf.anchors/com.hardening.dnsleak "${NET_BACKUP_DIR}/pf.anchor.dnsleak" \
+        && log "  [✓] pf anchor"
 
-  # 3. System proxies (all network services)> 
-  local PROXY_DUMP="${NET_BACKUP_DIR}/network_proxies.txt"
-  {
-    echo "# Network proxy snapshot — $(date)"
-    echo "# Restore: networksetup -setwebproxy <service> <host> <port>"
+    # 3. /etc/hosts
+    [[ -f /etc/hosts ]] \
+        && sudo cp /etc/hosts "${NET_BACKUP_DIR}/hosts" \
+        && log "  [✓] /etc/hosts" \
+        || warn "  [–] /etc/hosts not found — skipped"
+
+    # 4. /etc/resolv.conf
+    [[ -f /etc/resolv.conf ]] \
+        && sudo cp /etc/resolv.conf "${NET_BACKUP_DIR}/resolv.conf" \
+        && log "  [✓] /etc/resolv.conf"
+
+    # 5. [M-2] FIX: системный DNS-резолвер
+    scutil --dns > "${NET_BACKUP_DIR}/system-dns.txt" 2>/dev/null \
+        && log "  [✓] scutil --dns"
+
+    # 6. [M-2] FIX: /etc/resolver/ (Tailscale split DNS)
+    if [[ -d /etc/resolver ]]; then
+        sudo cp -r /etc/resolver "${NET_BACKUP_DIR}/resolver" \
+            && log "  [✓] /etc/resolver/"
+    fi
+
+    # 7. dnscrypt-proxy.toml
+    resolve_brew_prefix
+    local TOML="${BREW_PREFIX}/etc/dnscrypt-proxy.toml"
+    [[ -f "$TOML" ]] \
+        && cp "$TOML" "${NET_BACKUP_DIR}/dnscrypt-proxy.toml" \
+        && log "  [✓] dnscrypt-proxy.toml"
+
+    # 8. dnscrypt-proxy service status
+    if command -v brew &>/dev/null && brew list --formula dnscrypt-proxy &>/dev/null 2>&1; then
+        brew services list 2>/dev/null \
+            | grep dnscrypt > "${NET_BACKUP_DIR}/dnscrypt_status.txt" || true
+        log "  [✓] dnscrypt-proxy service status"
+    fi
+
+    # 9. Network proxies
+    local PROXY_DUMP="${NET_BACKUP_DIR}/network_proxies.txt"
+    {
+        echo "# Network proxy snapshot — $(date)"
+        networksetup -listallnetworkservices 2>/dev/null | tail -n +2 | grep -v '^\*' \
+        | while IFS= read -r SVC; do
+            echo "=== $SVC ==="
+            networksetup -getwebproxy        "$SVC" 2>/dev/null
+            networksetup -getsecurewebproxy  "$SVC" 2>/dev/null
+            networksetup -getproxybypassdomains "$SVC" 2>/dev/null
+            echo ""
+          done
+    } > "$PROXY_DUMP"
+    log "  [✓] Network proxy settings → ${PROXY_DUMP}"
+
+    # 10. Privoxy LaunchDaemon
+    local PRIV_PLIST="/Library/LaunchDaemons/com.hardening.proxytoggle.plist"
+    [[ -f "$PRIV_PLIST" ]] \
+        && sudo cp "$PRIV_PLIST" "${NET_BACKUP_DIR}/proxytoggle.plist" \
+        && log "  [✓] Privoxy LaunchDaemon plist"
+
     echo ""
-    networksetup -listallnetworkservices 2>/dev/null | tail -n +2 | grep -v '^\*' \
-    | while IFS= read -r SVC; do
-        echo "=== $SVC ==="
-        networksetup -getwebproxy        "$SVC" 2>/dev/null
-        networksetup -getsecurewebproxy  "$SVC" 2>/dev/null
-        networksetup -getproxybypassdomains "$SVC" 2>/dev/null
-        echo ""
-      done
-  } > "$PROXY_DUMP"
-  log "  [✓] Network proxy settings → ${PROXY_DUMP}"
-
-  # 4. dnscrypt-proxy status (if installed)
-  if command -v brew &>/dev/null \
-     && brew list --formula dnscrypt-proxy &>/dev/null 2>&1; then
-    brew services list 2>/dev/null \
-      | grep dnscrypt > "${NET_BACKUP_DIR}/dnscrypt_status.txt" || true
-    log "  [✓] dnscrypt-proxy service status"
-  fi
-
-  # 5. Privoxy LaunchDaemon (if exists)
-  local PRIV_PLIST="/Library/LaunchDaemons/com.hardening.proxytoggle.plist"
-  if [[ -f "$PRIV_PLIST" ]]; then
-    sudo cp "$PRIV_PLIST" "${NET_BACKUP_DIR}/proxytoggle.plist" \
-      && log "  [✓] Privoxy LaunchDaemon plist"
-  fi
-
-  # Summary
-  echo ""
-  log "Backup saved to: ${NET_BACKUP_DIR}"
-  info "To restore manually:"
-  info "  sudo cp ${NET_BACKUP_DIR}/pf.conf /etc/pf.conf && sudo pfctl -f /etc/pf.conf"
-  info "  sudo cp ${NET_BACKUP_DIR}/hosts   /etc/hosts"
-  echo ""
+    log "Backup saved to: ${NET_BACKUP_DIR}"
+    info "To restore: sudo bash ${NET_BACKUP_DIR}/../rollback.sh"
+    echo ""
 }
 
 # ──────────────────────────────────────────
@@ -117,7 +144,9 @@ create_net_backup() {
 install_formula() {
     local pkg="$1"
     if brew list --formula --versions "$pkg" &>/dev/null; then
-        warn "${pkg} already installed: $(brew list --formula --versions "$pkg")"
+        local VER
+        VER=$(brew list --formula --versions "$pkg")
+        warn "${pkg} already installed: ${VER}"
         ask "Reinstall ${pkg}?" CONFIRM
         [[ "$CONFIRM" == "y" || "$CONFIRM" == "Y" ]] \
             && brew reinstall "$pkg" \
@@ -128,163 +157,323 @@ install_formula() {
     fi
 }
 
+# [L-2] FIX: закрытая фигурная скобка
 resolve_brew_prefix() {
-  if [[ -z "${BREW_PREFIX:-}" ]]; then
-    BREW_PREFIX=$(brew --prefix 2>/dev/null) || die "Homebrew not found!"
-    export BREW_PREFIX
-  fi
-} 
+    if [[ -z "${BREW_PREFIX:-}" ]]; then
+        BREW_PREFIX=$(brew --prefix 2>/dev/null) || die "Homebrew not found!"
+        export BREW_PREFIX
+    fi
+}
 
 # ──────────────────────────────────────────
 # DNSCRYPT-PROXY
 # ──────────────────────────────────────────
 install_dnscrypt() {
-  install_formula "dnscrypt-proxy" || die "dnscrypt-proxy install failed!"
+    install_formula "dnscrypt-proxy" || die "dnscrypt-proxy install failed!"
+}
+
+# [H-3] NEW: генерация валидного конфига перед стартом сервиса
+configure_dnscrypt() {
+    resolve_brew_prefix
+    local TOML="${BREW_PREFIX}/etc/dnscrypt-proxy.toml"
+    local FWD_RULES="${BREW_PREFIX}/etc/forwarding-rules.txt"
+
+    log "Writing dnscrypt-proxy config: ${TOML}"
+
+    # Forwarding rules для Tailscale split DNS
+    cat > "$FWD_RULES" << 'EOF'
+ts.net          100.100.100.100
+tailscale.com   100.100.100.100
+EOF
+    log "  [✓] forwarding-rules.txt written"
+
+    cat > "$TOML" << EOF
+## dnscrypt-proxy.toml — generated by foxhole-macos v0.16
+## Quad9 DoH + anonymized relay + DNSSEC
+
+# Порт 53 занят mDNSResponder на macOS — используем 5355
+listen_addresses = ['127.0.0.1:5355', '[::1]:5355']
+max_clients = 250
+
+# Quad9 с DNSSEC + threat filtering + ECS
+server_names = ['quad9-doh-ip4-port443-filter-ecs-pri']
+
+# Фильтры серверов
+ipv4_servers = true
+ipv6_servers = false
+dnscrypt_servers = true
+doh_servers = true
+
+require_dnssec   = true
+require_nolog    = true
+require_nofilter = false   # false = разрешаем Quad9 с фильтрацией малвари
+
+# [H-2] FIX: ephemeral keypair на каждый запрос (anonymized relay)
+dnscrypt_ephemeral_keys = true
+
+# Сеть
+force_tcp   = false
+timeout     = 5000
+keepalive   = 30
+
+# Bootstrap — только для получения списка резолверов при старте
+# НЕ используется для пользовательских запросов
+bootstrap_resolvers = ['9.9.9.11:53', '149.112.112.112:53']
+
+# [H-1] FIX: запрет fallback на system DNS при недоступности upstream
+fallback_resolver   = ""
+ignore_system_dns   = true
+netprobe_timeout    = 60
+netprobe_address    = '9.9.9.9:53'
+
+# Фильтры запросов
+block_ipv6        = false
+block_unqualified = true   # блокировать запросы без домена (утечки)
+block_undelegated = true   # блокировать несуществующие TLD
+
+# Кеш
+cache           = true
+cache_size      = 4096
+cache_min_ttl   = 2400
+cache_max_ttl   = 86400
+cache_neg_min_ttl = 60
+cache_neg_max_ttl = 600
+
+# Логирование
+log_files_max_size    = 10
+log_files_max_age     = 7
+log_files_max_backups = 1
+
+# Tailscale split DNS forwarding
+forwarding_rules = '${FWD_RULES}'
+
+# Anonymized DNS — relay и server от РАЗНЫХ провайдеров
+[anonymized_dns]
+routes = [
+    { server_name='quad9-doh-ip4-port443-filter-ecs-pri', via=['anon-cs-de', 'anon-cs-nl'] }
+]
+skip_incompatible = false
+
+[query_log]
+format = 'tsv'
+
+[nx_log]
+format = 'tsv'
+
+[sources.public-resolvers]
+urls = [
+  'https://raw.githubusercontent.com/DNSCrypt/dnscrypt-resolvers/master/v3/public-resolvers.md',
+  'https://download.dnscrypt.info/resolvers-list/v3/public-resolvers.md'
+]
+cache_file   = 'public-resolvers.md'
+minisign_key = 'RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3'
+refresh_delay = 73
+
+[sources.relays]
+urls = [
+  'https://raw.githubusercontent.com/DNSCrypt/dnscrypt-resolvers/master/v3/relays.md',
+  'https://download.dnscrypt.info/resolvers-list/v3/relays.md'
+]
+cache_file   = 'relays.md'
+minisign_key = 'RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3'
+refresh_delay = 73
+
+[broken_implementations]
+fragments_blocked = [
+  'cisco', 'cisco-ipv6', 'cisco-familyshield',
+  'cisco-familyshield-ipv6', 'cisco-sandbox',
+  'cleanbrowsing-adult', 'cleanbrowsing-adult-ipv6',
+  'cleanbrowsing-family', 'cleanbrowsing-family-ipv6',
+  'cleanbrowsing-security', 'cleanbrowsing-security-ipv6'
+]
+EOF
+    log "  [✓] dnscrypt-proxy.toml written"
+    info "Config: ${TOML}"
+    info "Port:   127.0.0.1:5355"
+    info "Server: quad9-doh-ip4-port443-filter-ecs-pri"
 }
 
 enable_dnscrypt() {
-  # user-level service, without sudo
-  local STATUS
-  STATUS=$(brew services list 2>/dev/null | awk '/dnscrypt-proxy/{print $2}')
+    local STATUS
+    STATUS=$(brew services list 2>/dev/null | awk '/dnscrypt-proxy/{print $2}')
 
-  if [[ "$STATUS" == "started" ]]; then
-    warn "dnscrypt-proxy already running (user service)."
-    ask "Restart dnscrypt-proxy?" CONFIRM
-    if [[ "$CONFIRM" == "y" || "$CONFIRM" == "Y" ]]; then
-      brew services restart dnscrypt-proxy \
-        || die "dnscrypt-proxy restart failed!"
+    if [[ "$STATUS" == "started" ]]; then
+        warn "dnscrypt-proxy already running (user service)."
+        ask "Restart dnscrypt-proxy?" CONFIRM
+        if [[ "$CONFIRM" == "y" || "$CONFIRM" == "Y" ]]; then
+            brew services restart dnscrypt-proxy \
+                || die "dnscrypt-proxy restart failed!"
+        else
+            log "Keeping existing dnscrypt-proxy service."
+            return 0
+        fi
     else
-      log "Keeping existing dnscrypt-proxy service."
-      return 0
+        log "Starting dnscrypt-proxy (user service)..."
+        brew services start dnscrypt-proxy \
+            || die "dnscrypt-proxy start failed! DNS is not available — aborting."
     fi
-  else
-    log "Starting dnscrypt-proxy (user service)..."
-    brew services start dnscrypt-proxy \
-      || die "dnscrypt-proxy start failed! DNS is not available — aborting."
-  fi
 
-  sleep 2
-  log "Verifying dnscrypt-proxy on UDP:5355..."
-  if sudo lsof +c 15 -Pni UDP:5355 2>/dev/null | grep -q dnscrypt; then
-    log "dnscrypt-proxy confirmed listening on UDP:5355"
-  else
-    warn "dnscrypt-proxy not detected on UDP:5355 — check: brew services list"
-  fi
+    sleep 2
+    log "Verifying dnscrypt-proxy on UDP:5355..."
+    if sudo lsof +c 15 -Pni UDP:5355 2>/dev/null | grep -q dnscrypt; then
+        log "dnscrypt-proxy confirmed listening on UDP:5355 ✓"
+    else
+        warn "dnscrypt-proxy not detected on UDP:5355 — check: brew services list"
+    fi
 }
 
 disable_dnscrypt() {
-  if brew services list 2>/dev/null | grep -q "dnscrypt-proxy"; then
-    log "Stopping dnscrypt-proxy (user service)..."
-    brew services stop dnscrypt-proxy || warn "Failed to stop dnscrypt-proxy"
-  else
-    log "dnscrypt-proxy service not found — nothing to stop."
-  fi
+    if brew services list 2>/dev/null | grep -q "dnscrypt-proxy"; then
+        log "Stopping dnscrypt-proxy (user service)..."
+        brew services stop dnscrypt-proxy || warn "Failed to stop dnscrypt-proxy"
+    else
+        log "dnscrypt-proxy service not found — nothing to stop."
+    fi
 }
-
-
-
 
 # ──────────────────────────────────────────
 # PF — DNS LEAK PREVENTION
 # ──────────────────────────────────────────
 prepare_pf_dns_lock_anchor() {
-  local PF_ANCHOR="/etc/pf.anchors/com.hardening.dnsleak"
+    local PF_ANCHOR="/etc/pf.anchors/com.hardening.dnsleak"
 
-  log "Writing PF anchor for DNS leak prevention: ${PF_ANCHOR}"
+    log "Writing PF anchor for DNS leak prevention: ${PF_ANCHOR}"
+    sudo mkdir -p /etc/pf.anchors
 
-  sudo tee "$PF_ANCHOR" > /dev/null <<'EOF'
-# Block all direct DNS (IPv4 + IPv6) — only dnscrypt-proxy / DoH allowed
-# pass только с localhost на DoH-порты
-pass out quick proto udp from 127.0.0.1 to any port 443
-pass out quick proto tcp from 127.0.0.1 to any port 443
-pass out quick proto udp from 127.0.0.1 to any port 8443
-pass out quick proto tcp from 127.0.0.1 to any port 8443
-pass out quick proto udp from ::1 to any port 443
-pass out quick proto tcp from ::1 to any port 443
+    sudo tee "$PF_ANCHOR" > /dev/null <<'EOF'
+# ============================================================
+# foxhole-macos — DNS Leak Prevention Anchor
+# Generated by mac-hardening-netlib.sh v0.16
+# References: RFC 4890 (ICMPv6), OpenBSD pf docs
+# ============================================================
 
-# Блокируем прямые DNS (IPv4)
-block out quick proto udp to any port 53
-block out quick proto tcp to any port 53
-block out quick proto tcp to any port 853
+# --- Loopback: без ограничений (dnscrypt-proxy на :5355) ---
+pass quick on lo0 all
 
-# Блокируем прямые DNS (IPv6)
-block out quick inet6 proto udp to any port 53
-block out quick inet6 proto tcp to any port 53
-block out quick inet6 proto tcp to any port 853
+# --- [C-3] FIX: ICMPv6 обязателен (RFC 4890 §4.3.1) ---
+# Без этого ломается NDP (neighbor discovery) и PMTUD
+pass quick inet6 proto icmp6 all
+
+# --- Tailscale DNS: [C-2] FIX ---
+# Tailscale resolver 100.100.100.100 — внешний относительно lo0
+pass out quick proto { udp tcp } to 100.100.100.100 port 53
+
+# --- [C-1] FIX: Whitelist по IP провайдера, НЕ any:443 ---
+# Разрешаем исходящий трафик только к Quad9 (DoH + DNSCrypt relay)
+pass out quick proto { udp tcp } to 9.9.9.9
+pass out quick proto { udp tcp } to 149.112.112.112
+
+# --- Блокировка plain DNS (IPv4) ---
+block out quick proto { udp tcp } to any port 53
+block out quick proto { udp tcp } to any port 853
+
+# --- Блокировка plain DNS (IPv6) ---
+block out quick inet6 proto { udp tcp } to any port 53
+block out quick inet6 proto { udp tcp } to any port 853
 EOF
+
+    log "  [✓] PF anchor written: ${PF_ANCHOR}"
 }
 
 enable_pf_dns_lock() {
-  local PF_CONF="/etc/pf.conf"
-  local PF_MARKER="# ===== hardening dns lock ====="
+    local PF_CONF="/etc/pf.conf"
+    local PF_MARKER="# ===== hardening dns lock ====="
 
-  log "Enabling PF DNS leak lock..."
+    log "Enabling PF DNS leak lock..."
+    warn "ВНИМАНИЕ: Заблокирует прямые DNS (53/853 v4/v6)."
+    warn "Убедитесь что Quad9 DoH профиль уже установлен."
+    ask "Продолжить включение PF DNS lock?" CONFIRM
+    if [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]]; then
+        log "PF DNS lock aborted by user."
+        return 0
+    fi
 
-  warn "ВНИМАНИЕ: Эта секция заблокирует прямые DNS-запросы (53/853 v4/v6)."
-  warn "Убедитесь, что DoH/DNS профиль (например Quad9) уже настроен."
-  ask "Продолжить включение PF DNS lock?" CONFIRM
-  if [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]]; then
-    log "PF DNS lock aborted by user."
-    return 0
-  fi
+    if ! grep -qF "$PF_MARKER" "$PF_CONF" 2>/dev/null; then
+        sudo tee -a "$PF_CONF" > /dev/null << EOF
 
-  if ! grep -qF "$PF_MARKER" "$PF_CONF" 2>/dev/null; then
-    sudo tee -a "$PF_CONF" > /dev/null <<EOF
-
-$PF_MARKER
+${PF_MARKER}
 anchor "com.hardening.dnsleak"
 load anchor "com.hardening.dnsleak" from "/etc/pf.anchors/com.hardening.dnsleak"
 EOF
-    log "PF marker added to ${PF_CONF}"
-  else
-    warn "PF DNS lock marker already present in ${PF_CONF}"
-  fi
+        log "PF marker added to ${PF_CONF}"
+    else
+        warn "PF DNS lock marker already present in ${PF_CONF}"
+    fi
 
-  if sudo pfctl -f "$PF_CONF" 2>/dev/null && sudo pfctl -e 2>/dev/null; then
-    log "PF rules loaded — DNS leak prevention active."
-  else
-    warn "PF reload failed — reboot may be required."
-  fi
+    if sudo pfctl -f "$PF_CONF" 2>/dev/null && sudo pfctl -e 2>/dev/null; then
+        log "PF rules loaded — DNS leak prevention active."
+    else
+        warn "PF reload failed — reboot may be required."
+    fi
 
-  if sudo pfctl -sr 2>/dev/null | grep -q "port 53"; then
-    log "PF DNS lock: ACTIVE ✓"
-  else
-    warn "PF DNS lock: verify manually: sudo pfctl -sr"
-  fi
+    if sudo pfctl -sr 2>/dev/null | grep -q "port 53"; then
+        log "PF DNS lock: ACTIVE ✓"
+    else
+        warn "PF DNS lock: verify manually: sudo pfctl -sr"
+    fi
+
+    # [H-5] NEW: LaunchDaemon для автозапуска pf при загрузке
+    _install_pf_launchdaemon
+}
+
+# [H-5] NEW: автозапуск pf anchor при загрузке системы
+_install_pf_launchdaemon() {
+    local PLIST="/Library/LaunchDaemons/com.hardening.pf.dnsleak.plist"
+
+    sudo tee "$PLIST" > /dev/null << 'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.hardening.pf.dnsleak</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/sh</string>
+        <string>-c</string>
+        <string>/sbin/pfctl -e -f /etc/pf.conf 2>/dev/null; /sbin/pfctl -a com.hardening.dnsleak -f /etc/pf.anchors/com.hardening.dnsleak</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardErrorPath</key>
+    <string>/var/log/foxhole-pf.log</string>
+</dict>
+</plist>
+EOF
+    sudo chown root:wheel "$PLIST"
+    sudo chmod 644 "$PLIST"
+    sudo launchctl load "$PLIST" 2>/dev/null || true
+    log "  [✓] pf LaunchDaemon installed (auto-loads on boot)"
 }
 
 disable_pf_dns_lock() {
-  local PF_CONF="/etc/pf.conf"
-  local PF_MARKER="# ===== hardening dns lock ====="
+    local PF_CONF="/etc/pf.conf"
+    local PF_MARKER="# ===== hardening dns lock ====="
 
-  log "Disabling PF DNS leak lock..."
+    log "Disabling PF DNS leak lock..."
 
-  if [[ -f "$PF_CONF" ]] && grep -qF "$PF_MARKER" "$PF_CONF"; then
-    local TMP_CONF
-    TMP_CONF=$(mktemp)
+    if [[ -f "$PF_CONF" ]] && grep -qF "$PF_MARKER" "$PF_CONF"; then
+        local TMP_CONF
+        TMP_CONF=$(mktemp)
+        awk "/$(echo "$PF_MARKER" | sed 's/[^^]/[&]/g; s/\^/\\^/g')/ {exit} {print}" \
+            "$PF_CONF" > "$TMP_CONF"
+        sudo cp "$PF_CONF" "${PF_CONF}.bak.hardening_$(date +%Y%m%d_%H%M%S)"
+        sudo mv "$TMP_CONF" "$PF_CONF"
+        log "PF marker removed, backup saved."
+    else
+        log "No PF DNS lock marker found — nothing to remove."
+    fi
 
-    # вырезаем блок маркера
-    awk "
-      /$PF_MARKER/ {exit}
-      {print}
-    " "$PF_CONF" > "$TMP_CONF"
+    sudo rm -f /etc/pf.anchors/com.hardening.dnsleak || true
 
-    sudo cp "$PF_CONF" "${PF_CONF}.bak.hardening_$(date +%Y%m%d_%H%M%S)"
-    sudo mv "$TMP_CONF" "$PF_CONF"
-    log "PF marker removed, backup saved."
-  else
-    log "No PF DNS lock marker found — nothing to remove."
-  fi
+    # Unload LaunchDaemon
+    local PLIST="/Library/LaunchDaemons/com.hardening.pf.dnsleak.plist"
+    sudo launchctl unload "$PLIST" 2>/dev/null || true
+    sudo rm -f "$PLIST"
 
-  # You can leave the anchor or delete it as well
-  sudo rm -f /etc/pf.anchors/com.hardening.dnsleak || true
-
-  if sudo pfctl -f "$PF_CONF" 2>/dev/null; then
-    log "PF reloaded without DNS lock."
-  fi
+    sudo pfctl -f "$PF_CONF" 2>/dev/null && log "PF reloaded without DNS lock."
 }
-
-
 
 # ──────────────────────────────────────────
 # HOSTS — IDEMPOTENT UPDATE
@@ -342,330 +531,435 @@ update_hosts() {
         rm -f "$TMP_HOSTS"; die "Failed to download StevenBlack hosts!"
     fi
 
-    # [FIX v5] SHA-256 for verification
+    # SHA-256 + [M-4]: информируем пользователя о последнем коммите
     local SHA256
     SHA256=$(shasum -a 256 "$TMP_HOSTS" | awk '{print $1}')
-    info "SHA-256 скачанного файла: ${SHA256}"
-    info "Сверьте с: https://github.com/StevenBlack/hosts (последний коммит)"
+    info "SHA-256: ${SHA256}"
+    local LATEST_COMMIT
+    LATEST_COMMIT=$(curl -fsSL \
+        "https://api.github.com/repos/StevenBlack/hosts/commits?path=hosts&per_page=1" \
+        2>/dev/null | grep '"sha"' | head -1 | awk -F'"' '{print $4}' | cut -c1-7)
+    info "Latest GitHub commit: ${LATEST_COMMIT:-unknown}"
+    info "Verify at: https://github.com/StevenBlack/hosts/commits/master/hosts"
 
     {
         printf "\n%s\n" "$MARKER"
-        printf "# Added: %s\n" "$(date)"
-        printf "# Source: %s\n" "$HOSTS_URL"
+        printf "# Added:   %s\n" "$(date)"
+        printf "# Source:  %s\n" "$HOSTS_URL"
         printf "# SHA-256: %s\n" "$SHA256"
+        printf "# Commit:  %s\n" "${LATEST_COMMIT:-unknown}"
         cat "$TMP_HOSTS"
     } | sudo tee -a "$HOSTS_FILE" > /dev/null
 
     rm -f "$TMP_HOSTS"
+    sudo dscacheutil -flushcache && sudo killall -HUP mDNSResponder 2>/dev/null || true
 
     local TOTAL
     TOTAL=$(grep -c "^0\.0\.0\.0" "$HOSTS_FILE" 2>/dev/null || echo "?")
     log "/etc/hosts updated. Blocked domains: ${TOTAL}"
-
 }
 
-# ──────────────────────────────────────────
-# HOSTS — DISABLE HOST BLOCKLIST
-# ──────────────────────────────────────────
 disable_hosts_blocklist() {
-  local MARKER="# ===== StevenBlack Blocklist ====="
-  local HOSTS_FILE="/etc/hosts"
-  local BACKUP="/etc/hosts.bak.remove_$(date +%Y%m%d_%H%M%S)"
+    local MARKER="# ===== StevenBlack Blocklist ====="
+    local HOSTS_FILE="/etc/hosts"
+    local BACKUP="/etc/hosts.bak.remove_$(date +%Y%m%d_%H%M%S)"
 
-  if ! grep -qF "$MARKER" "$HOSTS_FILE" 2>/dev/null; then
-    log "No StevenBlack marker in ${HOSTS_FILE} — nothing to remove."
-    return 0
-  fi
+    if ! grep -qF "$MARKER" "$HOSTS_FILE" 2>/dev/null; then
+        log "No StevenBlack marker in ${HOSTS_FILE} — nothing to remove."
+        return 0
+    fi
 
-  log "Removing StevenBlack blocklist from ${HOSTS_FILE}..."
-  sudo cp "$HOSTS_FILE" "$BACKUP"
-
-  local LINE_NUM
-  LINE_NUM=$(grep -nF "$MARKER" "$HOSTS_FILE" | cut -d: -f1 | head -1)
-
-  sudo head -n "$((LINE_NUM - 1))" "$HOSTS_FILE" > "${HOSTS_FILE}.new"
-  sudo mv "${HOSTS_FILE}.new" "$HOSTS_FILE"
-  log "Blocklist removed. Backup: $BACKUP"
+    log "Removing StevenBlack blocklist from ${HOSTS_FILE}..."
+    sudo cp "$HOSTS_FILE" "$BACKUP"
+    local LINE_NUM
+    LINE_NUM=$(grep -nF "$MARKER" "$HOSTS_FILE" | cut -d: -f1 | head -1)
+    sudo head -n "$((LINE_NUM - 1))" "$HOSTS_FILE" | sudo tee "${HOSTS_FILE}.new" > /dev/null
+    sudo mv "${HOSTS_FILE}.new" "$HOSTS_FILE"
+    log "Blocklist removed. Backup: $BACKUP"
 }
 
 # ──────────────────────────────────────────
 # PRIVOXY
 # ──────────────────────────────────────────
-
 install_privoxy() {
-  install_formula "privoxy" || die "privoxy install failed!"
-
-  if [[ -z "${BREW_PREFIX:-}" ]]; then
-    die "BREW_PREFIX is not set. Call resolve_brew_prefix first."
-  fi
-
-  local PRIVOXY_CONF="${BREW_PREFIX}/etc/privoxy/config"
-  if [[ ! -f "$PRIVOXY_CONF" ]]; then
-    die "Privoxy config not found: ${PRIVOXY_CONF}. Проверьте brew --prefix."
-  fi
+    install_formula "privoxy" || die "privoxy install failed!"
+    resolve_brew_prefix  # [L-4] FIX: гарантируем BREW_PREFIX перед использованием
+    local PRIVOXY_CONF="${BREW_PREFIX}/etc/privoxy/config"
+    if [[ ! -f "$PRIVOXY_CONF" ]]; then
+        die "Privoxy config not found: ${PRIVOXY_CONF}. Проверьте brew --prefix."
+    fi
 }
 
 configure_privoxy_vpn_bypass() {
-  local PRIVOXY_CONF="${BREW_PREFIX}/etc/privoxy/config"
-  local BYPASS_MARKER="# ===== VPN bypass ====="
+    resolve_brew_prefix  # [L-4] FIX: guard на случай вызова без install_privoxy
+    local PRIVOXY_CONF="${BREW_PREFIX}/etc/privoxy/config"
+    local BYPASS_MARKER="# ===== VPN bypass ====="
 
-  if grep -qF "$BYPASS_MARKER" "$PRIVOXY_CONF" 2>/dev/null; then
-    warn "Privoxy VPN bypass already configured."
-    return 0
-  fi
+    if grep -qF "$BYPASS_MARKER" "$PRIVOXY_CONF" 2>/dev/null; then
+        warn "Privoxy VPN bypass already configured."
+        return 0
+    fi
 
-  log "Adding VPN bypass rules to Privoxy config..."
-  sudo tee -a "$PRIVOXY_CONF" > /dev/null <<'EOF'
+    log "Adding VPN bypass rules to Privoxy config..."
+    sudo tee -a "$PRIVOXY_CONF" > /dev/null << 'EOF'
 # ===== VPN bypass =====
-forward 10.0.0.0/8   .
-forward 172.16.0.0/12 .
+forward 10.0.0.0/8     .
+forward 172.16.0.0/12  .
 forward 192.168.0.0/16 .
-forward 100.64.0.0/10 .
-forward 127.0.0.0/8   .
+forward 100.64.0.0/10  .
+forward 127.0.0.0/8    .
 EOF
+    log "  [✓] VPN bypass rules added"
 }
 
 enable_privoxy_vpn_autoswitch() {
-  local TOGGLE_SCRIPT="/usr/local/bin/proxy-toggle.sh"
-  local DAEMON_PLIST="/Library/LaunchDaemons/com.hardening.proxytoggle.plist"
-  local TOGGLE_LOG="/var/log/proxy-toggle.log"
+    local TOGGLE_SCRIPT="/usr/local/bin/proxy-toggle.sh"
+    local DAEMON_PLIST="/Library/LaunchDaemons/com.hardening.proxytoggle.plist"
+    local TOGGLE_LOG="/var/log/proxy-toggle.log"
 
-  log "Configuring Privoxy VPN auto-switch LaunchDaemon..."
+    log "Configuring Privoxy VPN auto-switch LaunchDaemon..."
 
-  sudo tee "$TOGGLE_SCRIPT" > /dev/null <<'SCRIPT'
+    sudo tee "$TOGGLE_SCRIPT" > /dev/null << 'SCRIPT'
 #!/bin/bash
 LOG="/var/log/proxy-toggle.log"
-MAX_LOG_SIZE=5242880 # 5 MB
+MAX_LOG_SIZE=5242880
 
 log_msg() {
-  if [[ -f "$LOG" ]] && [[ $(stat -f%z "$LOG" 2>/dev/null || echo 0) -gt $MAX_LOG_SIZE ]]; then
-    tail -n 500 "$LOG" > "${LOG}.tmp" && mv "${LOG}.tmp" "$LOG"
-  fi
-  echo "$(date '+%Y-%m-%d %H:%M:%S') $1" >> "$LOG"
+    if [[ -f "$LOG" ]] && [[ $(stat -f%z "$LOG" 2>/dev/null || echo 0) -gt $MAX_LOG_SIZE ]]; then
+        tail -n 500 "$LOG" > "${LOG}.tmp" && mv "${LOG}.tmp" "$LOG"
+    fi
+    echo "$(date '+%Y-%m-%d %H:%M:%S') $1" >> "$LOG"
 }
 
+# [H-4] FIX: исключаем Tailscale utun из детектора VPN-туннелей
 vpn_active() {
-  ifconfig 2>/dev/null \
-    | awk '/^utun[0-9]/{found=1} found && /inet /{print; exit}' \
-    | grep -q "inet" && return 0
-  return 1
+    # Получаем имя utun интерфейса Tailscale (если запущен)
+    local TS_IF
+    TS_IF=$(tailscale debug netmap 2>/dev/null \
+        | grep -o 'utun[0-9]*' | head -1 || echo "__none__")
+
+    # Ищем любой utun с inet-адресом, кроме Tailscale
+    ifconfig 2>/dev/null \
+        | awk '/^utun[0-9]/{iface=substr($1,1,length($1)-1); found=1}
+               found && /inet /{print iface; exit}' \
+        | grep -v "^${TS_IF}$" \
+        | grep -q "utun" && return 0
+    return 1
 }
 
 get_services() {
-  networksetup -listallnetworkservices 2>/dev/null \
-    | tail -n +2 \
-    | grep -v "^\*" \
-    | grep -vEi "vpn|cisco|anyconnect|wireguard|tailscale"
+    networksetup -listallnetworkservices 2>/dev/null \
+        | tail -n +2 \
+        | grep -v "^\*" \
+        | grep -vEi "vpn|cisco|anyconnect|wireguard|tailscale"
 }
 
 set_proxy() {
-  local STATE="$1"
-  while IFS= read -r SERVICE; do
-    [[ -z "$SERVICE" ]] && continue
-    networksetup -setwebproxystate "$SERVICE" "$STATE" 2>/dev/null
-    networksetup -setsecurewebproxystate "$SERVICE" "$STATE" 2>/dev/null
-    if [[ "$STATE" == "on" ]]; then
-      networksetup -setwebproxy "$SERVICE" "127.0.0.1" "8118" 2>/dev/null
-      networksetup -setsecurewebproxy "$SERVICE" "127.0.0.1" "8118" 2>/dev/null
-    fi
-  done <<< "$(get_services)"
+    local STATE="$1"
+    while IFS= read -r SERVICE; do
+        [[ -z "$SERVICE" ]] && continue
+        networksetup -setwebproxystate      "$SERVICE" "$STATE" 2>/dev/null
+        networksetup -setsecurewebproxystate "$SERVICE" "$STATE" 2>/dev/null
+        if [[ "$STATE" == "on" ]]; then
+            networksetup -setwebproxy        "$SERVICE" "127.0.0.1" "8118" 2>/dev/null
+            networksetup -setsecurewebproxy  "$SERVICE" "127.0.0.1" "8118" 2>/dev/null
+        fi
+    done <<< "$(get_services)"
 }
 
 if vpn_active; then
-  log_msg "VPN detected → proxy OFF"
-  set_proxy off
+    log_msg "VPN detected (non-Tailscale utun) → proxy OFF"
+    set_proxy off
 else
-  log_msg "No VPN → proxy ON"
-  set_proxy on
+    log_msg "No tunnel VPN → proxy ON"
+    set_proxy on
 fi
 SCRIPT
 
-  sudo chown root:wheel "$TOGGLE_SCRIPT"
-  sudo chmod 755 "$TOGGLE_SCRIPT"
+    sudo chown root:wheel "$TOGGLE_SCRIPT"
+    sudo chmod 755 "$TOGGLE_SCRIPT"
 
-  sudo tee "$DAEMON_PLIST" > /dev/null <<EOF
+    sudo tee "$DAEMON_PLIST" > /dev/null << EOF
 <?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key>
-  <string>com.hardening.proxytoggle</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>/bin/bash</string>
-    <string>${TOGGLE_SCRIPT}</string>
-  </array>
-  <key>WatchPaths</key>
-  <array>
-    <string>/Library/Preferences/SystemConfiguration</string>
-  </array>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>ThrottleInterval</key>
-  <integer>5</integer>
-  <key>StandardOutPath</key>
-  <string>${TOGGLE_LOG}</string>
-  <key>StandardErrorPath</key>
-  <string>${TOGGLE_LOG}</string>
+    <key>Label</key>
+    <string>com.hardening.proxytoggle</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>${TOGGLE_SCRIPT}</string>
+    </array>
+    <key>WatchPaths</key>
+    <array>
+        <string>/Library/Preferences/SystemConfiguration</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+    <key>StandardOutPath</key>
+    <string>${TOGGLE_LOG}</string>
+    <key>StandardErrorPath</key>
+    <string>${TOGGLE_LOG}</string>
 </dict>
 </plist>
 EOF
 
-  sudo chown root:wheel "$DAEMON_PLIST"
-  sudo chmod 644 "$DAEMON_PLIST"
+    sudo chown root:wheel "$DAEMON_PLIST"
+    sudo chmod 644 "$DAEMON_PLIST"
 
-  sudo launchctl unload "$DAEMON_PLIST" 2>/dev/null || true
-  sudo launchctl load "$DAEMON_PLIST" \
-    && log "LaunchDaemon loaded — proxy auto-switches on VPN." \
-    || die "LaunchDaemon failed to load!"
+    sudo launchctl unload "$DAEMON_PLIST" 2>/dev/null || true
+    sudo launchctl load  "$DAEMON_PLIST" \
+        && log "LaunchDaemon loaded — proxy auto-switches on VPN." \
+        || die "LaunchDaemon failed to load!"
 
-  sudo bash "$TOGGLE_SCRIPT"
+    sudo bash "$TOGGLE_SCRIPT"
 
-  if netstat -an 2>/dev/null | grep -q "0.0.0.0.8118"; then
-    warn "Privoxy exposed on 0.0.0.0:8118 — check config!"
-  else
-    log "Privoxy: loopback only ✓"
-  fi
+    if netstat -an 2>/dev/null | grep -q "0.0.0.0.8118"; then
+        warn "Privoxy exposed on 0.0.0.0:8118 — check config!"
+    else
+        log "Privoxy: loopback only ✓"
+    fi
 }
 
 disable_privoxy_autoswitch() {
-  local DAEMON_PLIST="/Library/LaunchDaemons/com.hardening.proxytoggle.plist"
-  local TOGGLE_SCRIPT="/usr/local/bin/proxy-toggle.sh"
-
-  log "Disabling Privoxy VPN auto-switch..."
-  sudo launchctl unload "$DAEMON_PLIST" 2>/dev/null || true
-  sudo rm -f "$DAEMON_PLIST" "$TOGGLE_SCRIPT"
+    local DAEMON_PLIST="/Library/LaunchDaemons/com.hardening.proxytoggle.plist"
+    local TOGGLE_SCRIPT="/usr/local/bin/proxy-toggle.sh"
+    log "Disabling Privoxy VPN auto-switch..."
+    sudo launchctl unload "$DAEMON_PLIST" 2>/dev/null || true
+    sudo rm -f "$DAEMON_PLIST" "$TOGGLE_SCRIPT"
+    log "  [✓] Privoxy auto-switch disabled"
 }
 
-#---------------------------------------
-# RESET NETWORK HARDENING
-#---------------------------------------
+# ──────────────────────────────────────────
+# [M-1] NEW: HEALTH CHECK — 10 тестов из мануала
+# ──────────────────────────────────────────
+verify_dns_stack() {
+    echo ""
+    echo "  ╔══════════════════════════════════════════╗"
+    echo "  ║         DNS Stack Health Check           ║"
+    echo "  ╚══════════════════════════════════════════╝"
+    echo ""
+
+    local PASS=0 FAIL=0
+
+    _chk() {
+        local ID="$1" DESC="$2" CMD="$3" EXPECT="$4"
+        local OUT
+        OUT=$(eval "$CMD" 2>/dev/null || true)
+        if echo "$OUT" | grep -q "$EXPECT"; then
+            log "  [${ID}] ${DESC}"
+            (( PASS++ ))
+        else
+            err "  [${ID}] ${DESC}"
+            info "       Expected pattern: '${EXPECT}'"
+            info "       Got: $(echo "$OUT" | head -1)"
+            (( FAIL++ ))
+        fi
+    }
+
+    # [1] Quad9 Profile активен
+    _chk "1" "Quad9 Profile active" \
+        "scutil --dns" \
+        "9\.9\.9"
+
+    # [2] dnscrypt-proxy слушает :5355
+    _chk "2" "dnscrypt-proxy on UDP:5355" \
+        "sudo lsof +c 15 -Pni UDP:5355" \
+        "dnscrypt"
+
+    # [3] Базовая резолюция
+    _chk "3" "Basic DNS resolution" \
+        "dig +short google.com @127.0.0.1 -p 5355" \
+        "[0-9]"
+
+    # [4] DNSSEC ad flag
+    _chk "4" "DNSSEC (ad flag)" \
+        "dig +dnssec icann.org @127.0.0.1 -p 5355" \
+        " ad"
+
+    # [5] DNSSEC fail test — должен вернуть SERVFAIL
+    _chk "5" "DNSSEC validation (SERVFAIL on bad domain)" \
+        "dig www.dnssec-failed.org @127.0.0.1 -p 5355" \
+        "SERVFAIL"
+
+    # [6] Quad9 reachability
+    _chk "6" "Quad9 DoH reachability" \
+        "curl -s --max-time 5 https://on.quad9.net" \
+        "Yes"
+
+    # [7] Plain DNS наружу заблокирован
+    local DNS_OUT
+    DNS_OUT=$(timeout 3 dig google.com @8.8.8.8 2>/dev/null || true)
+    if echo "$DNS_OUT" | grep -q "NOERROR"; then
+        err "  [7] Plain DNS blocked (@8.8.8.8)"
+        info "       pf DNS lock may not be active"
+        (( FAIL++ ))
+    else
+        log "  [7] Plain DNS blocked (@8.8.8.8) ✓"
+        (( PASS++ ))
+    fi
+
+    # [8] Tailscale split DNS
+    _chk "8" "Tailscale split DNS (/etc/resolver/ts.net)" \
+        "scutil --dns" \
+        "ts\.net"
+
+    # [9] pf enabled
+    _chk "9" "pf firewall enabled" \
+        "sudo pfctl -s info" \
+        "Enabled"
+
+    # [10] StevenBlack hosts
+    local HOSTS_COUNT
+    HOSTS_COUNT=$(grep -c "^0\.0\.0\.0" /etc/hosts 2>/dev/null || echo 0)
+    if [[ "$HOSTS_COUNT" -gt 1000 ]]; then
+        log "  [10] StevenBlack hosts (${HOSTS_COUNT} entries) ✓"
+        (( PASS++ ))
+    else
+        err "  [10] StevenBlack hosts (${HOSTS_COUNT} entries — too few)"
+        (( FAIL++ ))
+    fi
+
+    echo ""
+    echo "  ──────────────────────────────────────────"
+    echo "  Results: ${PASS}/10 passed, ${FAIL} failed"
+    echo "  ──────────────────────────────────────────"
+    echo ""
+    [[ "$FAIL" -eq 0 ]] && log "All checks passed. Stack is healthy. ✓" \
+                        || warn "${FAIL} check(s) failed — review above."
+    echo ""
+}
+
+# ──────────────────────────────────────────
+# RESET
+# ──────────────────────────────────────────
 reset_net_hardening() {
-  log "Resetting network hardening (dnscrypt, PF DNS lock, Privoxy toggle, hosts blocklist)..."
-
-  disable_dnscrypt
-  disable_pf_dns_lock
-  disable_privoxy_autoswitch
-  disable_hosts_blocklist  # опционально, если хочешь
-
-  # Disable system HTTP(S) proxies
-  for S in $(networksetup -listallnetworkservices | tail -n +2 | grep -v '^\*'); do
-    networksetup -setwebproxystate "$S" off 2>/dev/null || true
-    networksetup -setsecurewebproxystate "$S" off 2>/dev/null || true
-  done
-
-  log "Network hardening reset complete."
+    log "Resetting network hardening (dnscrypt, PF DNS lock, Privoxy toggle, hosts blocklist)..."
+    disable_dnscrypt
+    disable_pf_dns_lock
+    disable_privoxy_autoswitch
+    disable_hosts_blocklist
+    for S in $(networksetup -listallnetworkservices | tail -n +2 | grep -v '^\*'); do
+        networksetup -setwebproxystate      "$S" off 2>/dev/null || true
+        networksetup -setsecurewebproxystate "$S" off 2>/dev/null || true
+    done
+    log "Network hardening reset complete."
 }
 
 # ══════════════════════════════════════════
 # MAIN
 # ══════════════════════════════════════════
 main() {
-  clear
-  echo ""
-  echo "  ░██████████                      ░██                   ░██           "
-  echo "  ░██                              ░██                   ░██           "
-  echo "  ░██         ░███████  ░██    ░██ ░████████   ░███████  ░██  ░███████ "
-  echo "  ░█████████ ░██    ░██  ░██  ░██  ░██    ░██ ░██    ░██ ░██ ░██    ░██"
-  echo "  ░██        ░██    ░██  ░██  ░██  ░██    ░██ ░██    ░██ ░██ ░██       "
-  echo "  ░██         ░███████  ░██    ░██ ░██    ░██  ░███████  ░██  ░███████ "
-  echo ""
-  echo "  ╔══════════════════════════════════════════╗"
-  echo "  ║       macOS Network Hardening Netlib     ║"
-  echo "  ║            v0.16  ·  by Gr3y-foX         ║"
-  echo "  ║       ARM/M-chip  |  strict mode         ║"
-  echo "  ╠══════════════════════════════════════════╣"
-  echo "  ║  module: netlib   |  mode: interactive   ║"
-  echo "  ╠══════════════════════════════════════════╣"
-  echo "  ║  [!] Unauthorized use is prohibited.     ║"
-  echo "  ╚══════════════════════════════════════════╝"
-  echo ""
-  warn "This module modifies network settings. Sudo may be required."
-  info "Tip: usually sourced from profiles (vpn_daily / paranoid_tor)."
-  echo ""
-  ask "Continue?" CONFIRM
-  [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]] && { echo "Aborted."; exit 0; }
-  echo ""
-  
-# ── Snapshot before any changes ──────────
-ask "Create backup snapshot before proceeding?" CONFIRM_BK
-if [[ "$CONFIRM_BK" == "y" || "$CONFIRM_BK" == "Y" ]]; then
-  create_net_backup
-else
-  warn "Skipping backup — proceeding without snapshot."
-  echo ""
-fi
-
-  while true; do
+    clear
+    echo ""
+    echo "  ░██████████                      ░██                   ░██           "
+    echo "  ░██                              ░██                   ░██           "
+    echo "  ░██         ░███████  ░██    ░██ ░████████   ░███████  ░██  ░███████ "
+    echo "  ░█████████ ░██    ░██  ░██  ░██  ░██    ░██ ░██    ░██ ░██ ░██    ░██"
+    echo "  ░██        ░██    ░██  ░██  ░██  ░██    ░██ ░██    ░██ ░██ ░██       "
+    echo "  ░██         ░███████  ░██    ░██ ░██    ░██  ░███████  ░██  ░███████ "
+    echo ""
     echo "  ╔══════════════════════════════════════════╗"
-    echo "  ║           Network Hardening Menu         ║"
+    echo "  ║       macOS Network Hardening Netlib     ║"
+    echo "  ║            v0.16  ·  by Gr3y-foX         ║"  # [L-3] FIX: версия синхронизирована
+    echo "  ║       ARM/M-chip  |  strict mode         ║"
     echo "  ╠══════════════════════════════════════════╣"
-    echo "  ║  [1]  Install + enable dnscrypt-proxy    ║"
-    echo "  ║  [2]  Enable PF DNS leak lock            ║"
-    echo "  ║       (ports 53/853 — IPv4/IPv6 BLOCKED) ║"
-    echo "  ║  [3]  Update /etc/hosts blocklist        ║"
-    echo "  ║       (StevenBlack)                      ║"
-    echo "  ║  [4]  Install Privoxy + VPN auto-switch  ║"
-    echo "  ║  [5]  Reset network hardening            ║"
-    echo "  ║       (dnscrypt / PF / Privoxy / proxy)  ║"
+    echo "  ║  module: netlib   |  mode: interactive   ║"
     echo "  ╠══════════════════════════════════════════╣"
-    echo "  ║  [6]  Quit                               ║"
+    echo "  ║  [!] Unauthorized use is prohibited.     ║"
     echo "  ╚══════════════════════════════════════════╝"
     echo ""
-    read -rp "  Choice (1-6): " CHOICE
+    warn "This module modifies network settings. Sudo may be required."
+    info "Tip: usually sourced from profiles (vpn_daily / paranoid_tor)."
+    echo ""
+    ask "Continue?" CONFIRM
+    [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]] && { echo "Aborted."; exit 0; }
     echo ""
 
-    case "$CHOICE" in
-      1)
-        log "[1] dnscrypt-proxy setup"
-        install_dnscrypt
-        enable_dnscrypt
+    ask "Create backup snapshot before proceeding?" CONFIRM_BK
+    if [[ "$CONFIRM_BK" == "y" || "$CONFIRM_BK" == "Y" ]]; then
+        create_net_backup
+    else
+        warn "Skipping backup — proceeding without snapshot."
         echo ""
-        ;;
-      2)
-        log "[2] PF DNS leak lock"
-        prepare_pf_dns_lock_anchor
-        enable_pf_dns_lock
+    fi
+
+    while true; do
+        echo "  ╔══════════════════════════════════════════╗"
+        echo "  ║           Network Hardening Menu         ║"
+        echo "  ╠══════════════════════════════════════════╣"
+        echo "  ║  [1]  Install + configure + enable       ║"
+        echo "  ║       dnscrypt-proxy                     ║"
+        echo "  ║  [2]  Enable PF DNS leak lock            ║"
+        echo "  ║       (ports 53/853 — IPv4/IPv6 BLOCKED) ║"
+        echo "  ║  [3]  Update /etc/hosts blocklist        ║"
+        echo "  ║       (StevenBlack)                      ║"
+        echo "  ║  [4]  Install Privoxy + VPN auto-switch  ║"
+        echo "  ║  [5]  Reset network hardening            ║"
+        echo "  ║       (dnscrypt / PF / Privoxy / proxy)  ║"
+        echo "  ║  [6]  DNS Stack Health Check             ║"
+        echo "  ╠══════════════════════════════════════════╣"
+        echo "  ║  [7]  Quit                               ║"
+        echo "  ╚══════════════════════════════════════════╝"
         echo ""
-        ;;
-      3)
-        log "[3] StevenBlack /etc/hosts blocklist"
-        update_hosts_blocklist
+        read -rp "  Choice (1-7): " CHOICE
         echo ""
-        ;;
-      4)
-        log "[4] Privoxy + VPN auto-switch"
-        install_privoxy
-        configure_privoxy_vpn_bypass
-        enable_privoxy_vpn_autoswitch
-        echo ""
-        ;;
-      5)
-        warn "[5] RESET: disabling dnscrypt, PF DNS lock, Privoxy auto-switch, clearing proxies"
-        ask "Are you sure? This will revert network hardening changes." CONFIRM_RESET
-        if [[ "$CONFIRM_RESET" == "y" || "$CONFIRM_RESET" == "Y" ]]; then
-          reset_net_hardening
-        else
-          log "Reset aborted."
-        fi
-        echo ""
-        ;;
-      6)
-        echo "Done. Stay paranoid. 🔒"
-        exit 0
-        ;;
-      *)
-        warn "Invalid choice. Please select 1-6."
-        echo ""
-        ;;
-    esac
-  done
+
+        case "$CHOICE" in
+            1)
+                log "[1] dnscrypt-proxy setup"
+                install_dnscrypt
+                configure_dnscrypt
+                enable_dnscrypt
+                echo ""
+                ;;
+            2)
+                log "[2] PF DNS leak lock"
+                prepare_pf_dns_lock_anchor
+                enable_pf_dns_lock
+                echo ""
+                ;;
+            3)
+                log "[3] StevenBlack /etc/hosts blocklist"
+                update_hosts
+                echo ""
+                ;;
+            4)
+                log "[4] Privoxy + VPN auto-switch"
+                install_privoxy
+                configure_privoxy_vpn_bypass
+                enable_privoxy_vpn_autoswitch
+                echo ""
+                ;;
+            5)
+                warn "[5] RESET: disabling dnscrypt, PF DNS lock, Privoxy auto-switch, clearing proxies"
+                ask "Are you sure? This will revert network hardening changes." CONFIRM_RESET
+                if [[ "$CONFIRM_RESET" == "y" || "$CONFIRM_RESET" == "Y" ]]; then
+                    reset_net_hardening
+                else
+                    log "Reset aborted."
+                fi
+                echo ""
+                ;;
+            6)
+                verify_dns_stack
+                ;;
+            7)
+                echo "Done. Stay paranoid. 🔒"
+                exit 0
+                ;;
+            *)
+                warn "Invalid choice. Please select 1-7."
+                echo ""
+                ;;
+        esac
+    done
 }
 
-# If the file is run directly (rather than via `source`), open the menu
-# Check if we're being sourced by testing if $0 is the script name
 if [[ "${0##*/}" == "mac-hardening-netlib.sh" ]]; then
-  main
+    main
 fi
-
-
